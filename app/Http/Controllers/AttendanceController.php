@@ -5,58 +5,93 @@ namespace App\Http\Controllers;
 use Illuminate\Http\Request;
 use App\Models\Attendance;
 use Illuminate\Support\Facades\Auth;
+use Illuminate\Support\Facades\Storage;
 
 class AttendanceController extends Controller
 {
     public function index()
     {
-        $user = Auth::user();
-        return view('attendance.index', compact('user'));
+        $attendance = Attendance::where('user_id', Auth::id())
+            ->whereDate('created_at', today())
+            ->first();
+
+        return view('attendance.index', compact('attendance'));
     }
 
     public function checkIn(Request $request)
     {
-        $user = Auth::user();
-
         $request->validate([
-            'latitude' => 'required|numeric',
-            'longitude' => 'required|numeric',
-            'photo' => 'required|image|max:2048',
+            'photo' => 'required',
+            'latitude' => 'required',
+            'longitude' => 'required',
         ]);
 
-        // Validasi jarak kantor
-        $office = $user->office;
-        $distance = $this->haversine($office->latitude, $office->longitude, $request->latitude, $request->longitude);
+        $user = Auth::user();
 
-        if ($distance > $office->radius) {
-            return back()->with('error', 'Anda berada di luar radius kantor!');
+        // 🚫 Cegah double check-in
+        $existing = Attendance::where('user_id', $user->id)
+            ->whereDate('created_at', today())
+            ->first();
+
+        if ($existing) {
+            return back()->with('error', 'Kamu sudah check-in hari ini!');
         }
 
-        // Upload foto
-        $photoPath = $request->file('photo')->store('attendance_photos', 'public');
+        $office = $user->office;
+
+        if (!$office) {
+            return back()->with('error', 'User belum terdaftar di kantor!');
+        }
+
+        // 📍 Hitung jarak
+        $distance = $this->calculateDistance(
+            $request->latitude,
+            $request->longitude,
+            $office->latitude,
+            $office->longitude
+        );
+
+        if ($distance > $office->radius) {
+            return back()->with('error', 'Kamu berada di luar radius kantor!');
+        }
+
+        // 🖼 Simpan foto
+        $image = str_replace('data:image/png;base64,', '', $request->photo);
+        $image = str_replace(' ', '+', $image);
+        $imageName = 'attendance_' . time() . '.png';
+
+        Storage::disk('public')->put(
+            'attendance/' . $imageName,
+            base64_decode($image)
+        );
 
         Attendance::create([
-            'user_id' => $user->id,
+            'user_id'   => $user->id,
             'office_id' => $office->id,
-            'check_in' => now(),
-            'latitude' => $request->latitude,
+            'check_in'  => now(),
+            'latitude'  => $request->latitude,
             'longitude' => $request->longitude,
-            'photo' => $photoPath,
+            'photo'     => $imageName,
         ]);
 
         return back()->with('success', 'Check-in berhasil!');
     }
 
-    // fungsi check-out mirip check-in
-    public function checkOut(Request $request)
+    public function checkOut()
     {
         $user = Auth::user();
 
         $attendance = Attendance::where('user_id', $user->id)
-            ->latest()
+            ->whereDate('created_at', today())
             ->first();
 
-        if (!$attendance) return back()->with('error', 'Belum check-in!');
+        if (!$attendance) {
+            return back()->with('error', 'Belum check-in!');
+        }
+
+        if ($attendance->check_out) {
+            return back()->with('error', 'Kamu sudah check-out!');
+        }
 
         $attendance->update([
             'check_out' => now()
@@ -65,16 +100,42 @@ class AttendanceController extends Controller
         return back()->with('success', 'Check-out berhasil!');
     }
 
-    // Hitung jarak (meter)
-    private function haversine($lat1, $lon1, $lat2, $lon2)
+    private function calculateDistance($lat1, $lon1, $lat2, $lon2)
     {
-        $earthRadius = 6371000; // meter
+        $earthRadius = 6371000;
+
         $dLat = deg2rad($lat2 - $lat1);
         $dLon = deg2rad($lon2 - $lon1);
-        $a = sin($dLat/2) * sin($dLat/2) +
-             cos(deg2rad($lat1)) * cos(deg2rad($lat2)) *
-             sin($dLon/2) * sin($dLon/2);
-        $c = 2 * atan2(sqrt($a), sqrt(1-$a));
+
+        $a = sin($dLat / 2) * sin($dLat / 2) +
+            cos(deg2rad($lat1)) * cos(deg2rad($lat2)) *
+            sin($dLon / 2) * sin($dLon / 2);
+
+        $c = 2 * atan2(sqrt($a), sqrt(1 - $a));
+
         return $earthRadius * $c;
     }
+
+    public function history(Request $request)
+{
+    /** @var \App\Models\User $user */
+    $user = Auth::user();
+    
+    $query = Attendance::with('user', 'office')
+        ->orderBy('created_at', 'desc');
+
+    // Hanya super-admin & admin yang bisa lihat semua
+    if (!$user->hasAnyRole(['super-admin', 'admin'])) {
+        $query->where('user_id', $user->id);
+    }
+
+    if ($request->date) {
+        $query->whereDate('created_at', $request->date);
+    }
+
+    $attendances = $query->paginate(10);
+
+    return view('attendance.history', compact('attendances'));
+}
+
 }
